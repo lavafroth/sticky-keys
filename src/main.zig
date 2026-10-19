@@ -41,7 +41,7 @@ pub const KEY_LEFTALT = 56;
 pub const KEY_RIGHTALT = 100;
 pub const EV_LED = 0x11;
 pub const LED_CAPSL = 0x01;
-const MODIFIERS = [_]i32{ KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_LEFTMETA, KEY_RIGHTMETA, KEY_LEFTALT, KEY_RIGHTALT };
+const MODIFIERS = [_]u16{ KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_LEFTMETA, KEY_RIGHTMETA, KEY_LEFTALT, KEY_RIGHTALT };
 
 const InputEvent = extern struct { time_sec: linux.time_t, time_usec: linux.time_t, type: u16, code: u16, value: i32 };
 const DeviceContext = struct {
@@ -50,14 +50,26 @@ const DeviceContext = struct {
     input_event: InputEvent,
     fn setCapsLockLED(self: *DeviceContext, value: i32) void {
         _ = linux.write(self.fd, @ptrCast(&InputEvent{
-            .type = EV_LED, // 0x11
-            .code = LED_CAPSL, // 0x1
+            .type = EV_LED,
+            .code = LED_CAPSL,
             .value = value,
             .time_sec = 0,
             .time_usec = 0,
         }), @sizeOf(InputEvent));
     }
 };
+
+const Config = struct {
+    double_tap: u64,
+};
+
+const KeyboardStateMachine = struct {
+    tainted: bool,
+    modifiers: [8]Modifier,
+};
+const ModifierState = enum(u8) { Free, Latched, Locked };
+const ModifierTransition = [3]ModifierState{ .Latched, .Free, .Free };
+const Modifier = struct { last: linux.time_t, state: ModifierState };
 
 const max_path_bytes = Io.Dir.max_path_bytes;
 
@@ -171,14 +183,17 @@ pub fn main(init: std.process.Init) !void {
     _ = try ring.read(@intFromPtr(&device), device.fd, .{ .buffer = @ptrCast(&device.input_event) }, 0);
     // TODO: queue future device requests like touchpads here
 
+    var machine: KeyboardStateMachine = .{ .modifiers = std.mem.zeroes([8]Modifier), .tainted = false };
+    const config = Config{ .double_tap = 200 };
+
     var user_data: u64 = 0;
     while (true) : (user_data += 1) {
         _ = try ring.submit_and_wait(1);
-        try consumeAndRequeue(&ring, uinput_fd);
+        try consumeAndRequeue(&ring, uinput_fd, &machine, &config);
     }
 }
 
-fn consumeAndRequeue(ring: *linux.IoUring, uinput_fd: i32) !void {
+fn consumeAndRequeue(ring: *linux.IoUring, uinput_fd: i32, machine: *KeyboardStateMachine, config: *const Config) !void {
     const head = ring.cq.head.* & ring.cq.mask;
     const cqe = ring.cq.cqes[head];
     defer ring.cq_advance(1);
@@ -191,18 +206,41 @@ fn consumeAndRequeue(ring: *linux.IoUring, uinput_fd: i32) !void {
     const device_context_ptr = cqe.user_data;
     const device_context: *DeviceContext = @ptrFromInt(device_context_ptr);
 
-    if (device_context.input_event.type == EV_KEY) {
-        _ = linux.write(uinput_fd, @ptrCast(&device_context.input_event), @sizeOf(InputEvent));
-        _ = linux.write(uinput_fd, @ptrCast(&std.mem.zeroes(InputEvent)), @sizeOf(InputEvent));
-        if (device_context.input_event.code == KEY_LEFTALT) return DebugError.EscapeHatch;
+    const is_key = device_context.input_event.type == EV_KEY;
+
+    if (is_key) {
+        if (device_context.input_event.code == KEY_RIGHTALT) return DebugError.EscapeHatch;
+        const modifier_index = std.mem.findScalar(u16, &MODIFIERS, device_context.input_event.code);
+
+        if (modifier_index == null) {
+            // TODO: handle eintr
+            _ = linux.write(uinput_fd, @ptrCast(&device_context.input_event), @sizeOf(InputEvent));
+            _ = linux.write(uinput_fd, @ptrCast(&std.mem.zeroes(InputEvent)), @sizeOf(InputEvent));
+        }
+
+        if (modifier_index != null and device_context.input_event.value == 1) {
+            const modifier = &machine.modifiers[modifier_index.?];
+            const current_time_ms: linux.time_t = device_context.input_event.time_sec * 1000 + @divTrunc(device_context.input_event.time_usec, 1000);
+            const elapsed_ms = current_time_ms - modifier.last;
+
+            var new_state = ModifierState.Locked;
+
+            if (elapsed_ms > config.double_tap) {
+                new_state = ModifierTransition[@intFromEnum(modifier.state)];
+            }
+            machine.tainted = modifier.state != new_state;
+            if (machine.tainted) {
+                modifier.state = new_state;
+            }
+
+            modifier.last = current_time_ms;
+
+            std.debug.print("{d} = {any}\n", .{ modifier_index.?, modifier.state });
+        }
     }
 
     _ = try ring.read(device_context_ptr, device_context.fd, .{ .buffer = @ptrCast(&device_context.input_event) }, 0);
 }
-
-// const KeyboardStateMachine = struct {
-
-// };
 
 test "test sample devices proc file" {
     const io = std.testing.io;
