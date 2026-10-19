@@ -3,14 +3,66 @@ const Io = std.Io;
 
 const linux = std.os.linux;
 
+// const c = @cImport(@cInclude("linux/uinput.h"));
+
+pub const UInputSetup = extern struct {
+    bustype: u16,
+    vendor: u16,
+    product: u16,
+    version: u16,
+    name: [80]u8,
+    ff_effects_max: u32 = 0,
+};
+
+/// ioctl command to exclusively grab a device
+pub const EVIOCGRAB = linux.IOCTL.IOW('E', 0x90, c_int);
+pub const EVIOCSCLOCKID = linux.IOCTL.IOW('E', 0xa0, c_int);
+pub const CLOCK_MONOTONIC = 1;
+
+const UINPUT_IOCTL_BASE = 'U';
+pub const UI_SET_EVBIT = linux.IOCTL.IOW(UINPUT_IOCTL_BASE, 100, c_int);
+pub const UI_SET_KEYBIT = linux.IOCTL.IOW(UINPUT_IOCTL_BASE, 101, c_int);
+pub const UI_DEV_CREATE = linux.IOCTL.IO(UINPUT_IOCTL_BASE, 1);
+pub const UI_DEV_DESTROY = linux.IOCTL.IO(UINPUT_IOCTL_BASE, 2);
+pub const UI_DEV_SETUP = linux.IOCTL.IOW(UINPUT_IOCTL_BASE, 3, UInputSetup);
+pub const EV_KEY = 0x01;
+pub const EV_SYN = 0x00;
+pub const SYN_REPORT = 0x00;
+pub const KEY_MAX = 0x2ff;
+pub const KEY_CNT = KEY_MAX + 1;
+
+pub const KEY_LEFTCTRL = 29;
+pub const KEY_RIGHTCTRL = 97;
+pub const KEY_LEFTSHIFT = 42;
+pub const KEY_RIGHTSHIFT = 54;
+pub const KEY_LEFTMETA = 125;
+pub const KEY_RIGHTMETA = 126;
+pub const KEY_LEFTALT = 56;
+pub const KEY_RIGHTALT = 100;
+pub const EV_LED = 0x11;
+pub const LED_CAPSL = 0x01;
+const MODIFIERS = [_]i32{ KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_LEFTMETA, KEY_RIGHTMETA, KEY_LEFTALT, KEY_RIGHTALT };
+
 const InputEvent = extern struct { time_sec: linux.time_t, time_usec: linux.time_t, type: u16, code: u16, value: i32 };
+const DeviceContext = struct {
+    fd: i32,
+    path: []u8,
+    input_event: InputEvent,
+    fn setCapsLockLED(self: *DeviceContext, value: i32) void {
+        _ = linux.write(self.fd, @ptrCast(&InputEvent{
+            .type = EV_LED, // 0x11
+            .code = LED_CAPSL, // 0x1
+            .value = value,
+            .time_sec = 0,
+            .time_usec = 0,
+        }), @sizeOf(InputEvent));
+    }
+};
 
-const DeviceContext = struct { fd: i32, path: []u8, input_event: InputEvent };
-
-const sticky_keys = @import("sticky_keys");
 const max_path_bytes = Io.Dir.max_path_bytes;
 
 const DeviceDetectionError = error{NoKeyboardFound};
+const DebugError = error{EscapeHatch};
 
 /// Greedily fills the pb buffer with the name of the first
 /// `kbd` handler device having the word "keyboard" in the name.
@@ -49,12 +101,9 @@ pub fn parseInputProcFile(file: Io.File, pb: *[max_path_bytes]u8, io: Io) !usize
         if (std.mem.eql(u8, line.buffer[0..handler_prefix.len], handler_prefix) and
             std.mem.find(u8, line.buffer[handler_prefix.len..], "kbd") != null)
         {
-            var offset = std.mem.find(u8, line.buffer[handler_prefix.len..], "event") orelse continue;
+            const offset = std.mem.find(u8, line.buffer[handler_prefix.len..], "event") orelse continue;
             const began = offset + handler_prefix.len;
-            offset = std.mem.find(u8, line.buffer[began..], " ") orelse continue;
-            const ended = offset + began;
-
-            // device_path_len = offset;
+            const ended = (std.mem.find(u8, line.buffer[began..], " ") orelse line.end) + began;
 
             if (name_has_keyboard) {
                 const written = try std.fmt.bufPrint(pb, "/dev/input/{s}", .{line.buffer[began..ended]});
@@ -69,39 +118,98 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var pb: [max_path_bytes]u8 = undefined;
     const pb_len = try detectKeyboard(&pb, io);
+    pb[pb_len] = 0;
 
     // pb must live as long as device
     var device = DeviceContext{
         .fd = 0,
         .input_event = undefined,
-        .path = pb[0..pb_len],
+        .path = pb[0 .. pb_len + 1],
     };
-    const file = try Io.Dir.openFileAbsolute(io, device.path, .{ .mode = .read_only });
-    defer file.close(io);
+    const keyboard: i32 = @intCast(linux.open(@ptrCast(device.path), .{ .ACCMODE = .RDWR, .NONBLOCK = true }, 0o644));
+    defer _ = linux.close(keyboard);
 
-    device.fd = file.handle;
+    device.fd = keyboard;
+
+    device.setCapsLockLED(1);
+
+    try io.sleep(.fromSeconds(1), .awake);
+
+    _ = linux.ioctl(device.fd, EVIOCSCLOCKID, CLOCK_MONOTONIC);
+    _ = linux.ioctl(device.fd, EVIOCGRAB, 1);
+    defer _ = linux.ioctl(device.fd, EVIOCGRAB, 0);
+
+    try io.sleep(.fromSeconds(1), .awake);
+
+    const uinput_fd: i32 = @intCast(linux.open("/dev/uinput", .{ .ACCMODE = .WRONLY, .NONBLOCK = true }, 0o644));
+    defer _ = linux.close(uinput_fd);
+
+    _ = linux.ioctl(uinput_fd, UI_SET_EVBIT, EV_KEY);
+    for (0..KEY_CNT) |i| {
+        _ = linux.ioctl(uinput_fd, UI_SET_KEYBIT, i);
+    }
+
+    var setup = std.mem.zeroes(UInputSetup);
+    setup.vendor = 0xbabe;
+    setup.product = 0x1337;
+    setup.version = 0x0001;
+    const name = "sticky keys";
+    for (name, 0..) |v, i| {
+        setup.name[i] = v;
+    }
+
+    _ = linux.ioctl(uinput_fd, UI_DEV_SETUP, @intFromPtr(&setup));
+    _ = linux.ioctl(uinput_fd, UI_DEV_CREATE, 0);
+
+    defer _ = linux.ioctl(uinput_fd, UI_DEV_DESTROY, 0);
 
     var ring = try linux.IoUring.init(16, 0);
     defer ring.deinit();
 
-    while (true) {
-        _ = try ring.read(69, device.fd, linux.IoUring.ReadBuffer{ .buffer = @ptrCast(&device.input_event) }, 0);
+    std.debug.print("latched to {s}\n", .{device.path});
+
+    _ = try ring.read(@intFromPtr(&device), device.fd, .{ .buffer = @ptrCast(&device.input_event) }, 0);
+    // TODO: queue future device requests like touchpads here
+
+    var user_data: u64 = 0;
+    while (true) : (user_data += 1) {
         _ = try ring.submit_and_wait(1);
-        const cqe = try ring.copy_cqe();
-
-        if (device.input_event.type != 1) { // EV_KEY
-            continue;
-        }
-
-        std.debug.print("result {d} userdata: {d}\n", .{ cqe.res, cqe.user_data });
-        std.debug.print("{any}\n", .{device.input_event});
+        try consumeAndRequeue(&ring, uinput_fd);
     }
 }
+
+fn consumeAndRequeue(ring: *linux.IoUring, uinput_fd: i32) !void {
+    const head = ring.cq.head.* & ring.cq.mask;
+    const cqe = ring.cq.cqes[head];
+    defer ring.cq_advance(1);
+
+    if (cqe.res != @sizeOf(InputEvent)) {
+        return;
+    }
+
+    // cater to whichever device sends an event
+    const device_context_ptr = cqe.user_data;
+    const device_context: *DeviceContext = @ptrFromInt(device_context_ptr);
+
+    if (device_context.input_event.type == EV_KEY) {
+        _ = linux.write(uinput_fd, @ptrCast(&device_context.input_event), @sizeOf(InputEvent));
+        _ = linux.write(uinput_fd, @ptrCast(&std.mem.zeroes(InputEvent)), @sizeOf(InputEvent));
+        if (device_context.input_event.code == KEY_LEFTALT) return DebugError.EscapeHatch;
+    }
+
+    _ = try ring.read(device_context_ptr, device_context.fd, .{ .buffer = @ptrCast(&device_context.input_event) }, 0);
+}
+
+// const KeyboardStateMachine = struct {
+
+// };
 
 test "test sample devices proc file" {
     const io = std.testing.io;
     var file = try std.Io.Dir.cwd().openFile(io, "tests/procfile", .{ .mode = .read_only });
     defer file.close(io);
     var pb: [max_path_bytes]u8 = undefined;
-    _ = try parseInputProcFile(file, &pb, io);
+    const name_len = try parseInputProcFile(file, &pb, io);
+    const is_event0 = std.mem.eql(u8, pb[0..name_len], "/dev/input/event0");
+    try std.testing.expect(is_event0);
 }
