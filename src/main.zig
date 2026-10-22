@@ -59,17 +59,105 @@ const DeviceContext = struct {
     }
 };
 
+const VirtualDevice = struct {
+    fd: i32,
+
+    /// Writes accumulated change events in the state machine to the virtual device.
+    /// Guarantees single write to virtual device descriptor.
+    fn dispatch(self: *VirtualDevice, transaction: []u8) void {
+        // TODO: handle EINTR
+        _ = linux.write(self.fd, @ptrCast(transaction), transaction.len);
+    }
+};
+
 const Config = struct {
     double_tap: u64,
 };
 
-const KeyboardStateMachine = struct {
-    tainted: bool,
-    modifiers: [8]Modifier,
+const ModifierState = enum(u8) {
+    Free,
+    Latched,
+    Locked,
+    fn value(self: ModifierState) i32 {
+        if (self == .Free) return 0;
+        return 1;
+    }
 };
-const ModifierState = enum(u8) { Free, Latched, Locked };
 const ModifierTransition = [3]ModifierState{ .Latched, .Free, .Free };
 const Modifier = struct { last: linux.time_t, state: ModifierState };
+
+const KeyboardHandler = struct {
+    modifiers: [8]Modifier,
+
+    // 1 extra for buffer input event
+    // 1 extra for ev_syn synchronization event
+    delta: [10]InputEvent,
+
+    n_delta: usize,
+    n_free: usize,
+    double_tap: u64,
+
+    fn unlatch(self: *KeyboardHandler) void {
+        for (0..self.modifiers.len) |i| {
+            if (self.modifiers[i].state == .Latched) {
+                self.modifiers[i].state = .Free;
+                self.modifier_delta(i, ModifierState.Free.value());
+                self.n_free += 1;
+            }
+        }
+        std.debug.print("\t\t{d} free\n", .{self.n_free});
+    }
+
+    fn store_delta(self: *KeyboardHandler, ev: InputEvent) void {
+        self.delta[self.n_delta] = ev;
+        self.n_delta += 1;
+    }
+
+    fn modifier_delta(self: *KeyboardHandler, index: usize, value: i32) void {
+        self.store_delta(InputEvent{
+            .type = EV_KEY,
+            .code = MODIFIERS[index],
+            .value = value,
+            .time_sec = 0,
+            .time_usec = 0,
+        });
+    }
+
+    /// Appends finishing synchronize event to internal change tracking buffer.
+    fn finalize(self: *KeyboardHandler) []u8 {
+        self.store_delta(std.mem.zeroes(InputEvent));
+        const ret: []u8 = @ptrCast(self.delta[0 .. self.n_delta + 1]);
+        self.n_delta = 0;
+        return ret;
+    }
+
+    fn indicator(self: *KeyboardHandler) i32 {
+        return @intFromBool(self.n_free != self.modifiers.len);
+    }
+
+    fn modifier_pressed(self: *KeyboardHandler, modifier_index: usize, event_time_ms: linux.time_t) void {
+        const modifier = &self.modifiers[modifier_index];
+        const elapsed_ms = event_time_ms - modifier.last;
+
+        var new_state = ModifierState.Locked;
+
+        if (elapsed_ms > self.double_tap)
+            new_state = ModifierTransition[@intFromEnum(modifier.state)];
+
+        if (modifier.state != new_state) {
+            const old_free = modifier.state == .Free;
+            const new_free = new_state == .Free;
+            if (!old_free and new_free) self.n_free += 1;
+            if (!new_free and old_free) self.n_free -= 1;
+
+            modifier.state = new_state;
+            self.modifier_delta(modifier_index, new_state.value());
+        }
+        modifier.last = event_time_ms;
+
+        std.debug.print("{d} = {any}\t{d} free\n", .{ modifier_index, modifier.state, self.n_free });
+    }
+};
 
 const max_path_bytes = Io.Dir.max_path_bytes;
 
@@ -138,12 +226,11 @@ pub fn main(init: std.process.Init) !void {
         .input_event = undefined,
         .path = pb[0 .. pb_len + 1],
     };
+
     const keyboard: i32 = @intCast(linux.open(@ptrCast(device.path), .{ .ACCMODE = .RDWR, .NONBLOCK = true }, 0o644));
     defer _ = linux.close(keyboard);
 
     device.fd = keyboard;
-
-    device.setCapsLockLED(1);
 
     try io.sleep(.fromSeconds(1), .awake);
 
@@ -175,6 +262,8 @@ pub fn main(init: std.process.Init) !void {
 
     defer _ = linux.ioctl(uinput_fd, UI_DEV_DESTROY, 0);
 
+    var virtual_device = VirtualDevice{ .fd = uinput_fd };
+
     var ring = try linux.IoUring.init(16, 0);
     defer ring.deinit();
 
@@ -183,17 +272,19 @@ pub fn main(init: std.process.Init) !void {
     _ = try ring.read(@intFromPtr(&device), device.fd, .{ .buffer = @ptrCast(&device.input_event) }, 0);
     // TODO: queue future device requests like touchpads here
 
-    var machine: KeyboardStateMachine = .{ .modifiers = std.mem.zeroes([8]Modifier), .tainted = false };
+    // config from ini file
     const config = Config{ .double_tap = 200 };
+    var machine: KeyboardHandler = .{ .modifiers = std.mem.zeroes([8]Modifier), .double_tap = config.double_tap, .delta = undefined, .n_delta = 0, .n_free = 8 };
 
+    // ring.timeout(user_data: u64, ts: *const kernel_timespec, count: u32, flags: u32)
     var user_data: u64 = 0;
     while (true) : (user_data += 1) {
         _ = try ring.submit_and_wait(1);
-        try consumeAndRequeue(&ring, uinput_fd, &machine, &config);
+        try consumeAndRequeue(&ring, &virtual_device, &machine);
     }
 }
 
-fn consumeAndRequeue(ring: *linux.IoUring, uinput_fd: i32, machine: *KeyboardStateMachine, config: *const Config) !void {
+fn consumeAndRequeue(ring: *linux.IoUring, virtual_device: *VirtualDevice, machine: *KeyboardHandler) !void {
     const head = ring.cq.head.* & ring.cq.mask;
     const cqe = ring.cq.cqes[head];
     defer ring.cq_advance(1);
@@ -213,30 +304,18 @@ fn consumeAndRequeue(ring: *linux.IoUring, uinput_fd: i32, machine: *KeyboardSta
         const modifier_index = std.mem.findScalar(u16, &MODIFIERS, device_context.input_event.code);
 
         if (modifier_index == null) {
-            // TODO: handle eintr
-            _ = linux.write(uinput_fd, @ptrCast(&device_context.input_event), @sizeOf(InputEvent));
-            _ = linux.write(uinput_fd, @ptrCast(&std.mem.zeroes(InputEvent)), @sizeOf(InputEvent));
+            machine.store_delta(device_context.input_event);
+            machine.unlatch();
+            virtual_device.dispatch(machine.finalize());
         }
 
         if (modifier_index != null and device_context.input_event.value == 1) {
-            const modifier = &machine.modifiers[modifier_index.?];
-            const current_time_ms: linux.time_t = device_context.input_event.time_sec * 1000 + @divTrunc(device_context.input_event.time_usec, 1000);
-            const elapsed_ms = current_time_ms - modifier.last;
-
-            var new_state = ModifierState.Locked;
-
-            if (elapsed_ms > config.double_tap) {
-                new_state = ModifierTransition[@intFromEnum(modifier.state)];
-            }
-            machine.tainted = modifier.state != new_state;
-            if (machine.tainted) {
-                modifier.state = new_state;
-            }
-
-            modifier.last = current_time_ms;
-
-            std.debug.print("{d} = {any}\n", .{ modifier_index.?, modifier.state });
+            const event_time_ms = device_context.input_event.time_sec * 1000 + @divTrunc(device_context.input_event.time_usec, 1000);
+            machine.modifier_pressed(modifier_index.?, event_time_ms);
+            virtual_device.dispatch(machine.finalize());
         }
+
+        device_context.setCapsLockLED(machine.indicator());
     }
 
     _ = try ring.read(device_context_ptr, device_context.fd, .{ .buffer = @ptrCast(&device_context.input_event) }, 0);
