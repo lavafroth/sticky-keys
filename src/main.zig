@@ -3,8 +3,10 @@ const Io = std.Io;
 
 const linux = std.os.linux;
 
-// const c = @cImport(@cInclude("linux/uinput.h"));
-
+pub const BTN_LEFT = 0x110;
+pub const BTN_RIGHT = 0x111;
+pub const BTN_TOOL_FINGER = 0x145;
+pub const BTN_TOUCH = 0x14a;
 pub const UInputSetup = extern struct {
     bustype: u16,
     vendor: u16,
@@ -25,8 +27,11 @@ pub const UI_SET_KEYBIT = linux.IOCTL.IOW(UINPUT_IOCTL_BASE, 101, c_int);
 pub const UI_DEV_CREATE = linux.IOCTL.IO(UINPUT_IOCTL_BASE, 1);
 pub const UI_DEV_DESTROY = linux.IOCTL.IO(UINPUT_IOCTL_BASE, 2);
 pub const UI_DEV_SETUP = linux.IOCTL.IOW(UINPUT_IOCTL_BASE, 3, UInputSetup);
-pub const EV_KEY = 0x01;
 pub const EV_SYN = 0x00;
+pub const EV_KEY = 0x01;
+pub const ABS_X = 0x00;
+pub const ABS_Y = 0x01;
+pub const EV_ABS = 0x03;
 pub const SYN_REPORT = 0x00;
 pub const KEY_MAX = 0x2ff;
 pub const KEY_CNT = KEY_MAX + 1;
@@ -43,7 +48,16 @@ pub const EV_LED = 0x11;
 pub const LED_CAPSL = 0x01;
 const MODIFIERS = [_]u16{ KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_LEFTMETA, KEY_RIGHTMETA, KEY_LEFTALT, KEY_RIGHTALT };
 
-const InputEvent = extern struct { time_sec: linux.time_t, time_usec: linux.time_t, type: u16, code: u16, value: i32 };
+const InputEvent = extern struct {
+    time_sec: linux.time_t,
+    time_usec: linux.time_t,
+    type: u16,
+    code: u16,
+    value: i32,
+    fn timeMilliseconds(self: *InputEvent) i64 {
+        return self.time_sec * 1000 + @divTrunc(self.time_usec, 1000);
+    }
+};
 const DeviceContext = struct {
     fd: i32,
     path: []u8,
@@ -57,21 +71,45 @@ const DeviceContext = struct {
             .time_usec = 0,
         }), @sizeOf(InputEvent));
     }
+    fn sync(self: *DeviceContext) void {
+        _ = linux.write(self.fd, @ptrCast(&std.mem.zeroes(InputEvent)), @sizeOf(InputEvent));
+    }
 };
 
 const VirtualDevice = struct {
     fd: i32,
 
-    /// Writes accumulated change events in the state machine to the virtual device.
-    /// Guarantees single write to virtual device descriptor.
-    fn dispatch(self: *VirtualDevice, transaction: []u8) void {
+    fn dispatch(self: *VirtualDevice, transaction: []const u8) void {
         // TODO: handle EINTR
         _ = linux.write(self.fd, @ptrCast(transaction), transaction.len);
+    }
+
+    fn sendEvent(
+        self: *VirtualDevice,
+        typ: u16,
+        code: u16,
+        value: i32,
+    ) void {
+        self.dispatch(@ptrCast(&InputEvent{ .code = code, .type = typ, .value = value, .time_sec = 0, .time_usec = 0 }));
+    }
+
+    fn sync(self: *VirtualDevice) void {
+        self.sendEvent(EV_SYN, SYN_REPORT, 0);
+    }
+
+    fn sendKey(
+        self: *VirtualDevice,
+        code: u16,
+        value: i32,
+    ) void {
+        self.sendEvent(EV_KEY, code, value);
     }
 };
 
 const Config = struct {
     double_tap: u64,
+    touch_timeout: i64,
+    touch_grace_area: i64,
 };
 
 const ModifierState = enum(u8) {
@@ -86,80 +124,85 @@ const ModifierState = enum(u8) {
 const ModifierTransition = [3]ModifierState{ .Latched, .Free, .Free };
 const Modifier = struct { last: linux.time_t, state: ModifierState };
 
-const KeyboardHandler = struct {
+const Point2D = struct {
+    x: i64,
+    y: i64,
+};
+
+const TouchStage = enum(u8) {
+    NotedXY = 0,
+    Initialized,
+    NotedX,
+};
+
+const Touch = struct {
+    began: Point2D,
+    ended: Point2D,
+    last_ms: i64,
+    stage: TouchStage,
+};
+
+const Handler = struct {
     modifiers: [8]Modifier,
+    keyboard: *DeviceContext,
+    virtual_device: *VirtualDevice,
+    touch: Touch,
+    config: *const Config,
 
-    // 1 extra for buffer input event
-    // 1 extra for ev_syn synchronization event
-    delta: [10]InputEvent,
-
-    n_delta: usize,
-    n_free: usize,
-    double_tap: u64,
-
-    fn unlatch(self: *KeyboardHandler) void {
+    fn unlatch(self: *Handler) void {
         for (0..self.modifiers.len) |i| {
-            if (self.modifiers[i].state == .Latched) {
-                self.modifiers[i].state = .Free;
-                self.modifier_delta(i, ModifierState.Free.value());
-                self.n_free += 1;
-            }
+            if (self.modifiers[i].state == .Latched) self.modifiers[i].state = .Free;
         }
-        std.debug.print("\t\t{d} free\n", .{self.n_free});
     }
 
-    fn store_delta(self: *KeyboardHandler, ev: InputEvent) void {
-        self.delta[self.n_delta] = ev;
-        self.n_delta += 1;
+    fn commit(self: *Handler) void {
+        for (0..self.modifiers.len) |i| {
+            self.virtual_device.sendKey(MODIFIERS[i], self.modifiers[i].state.value());
+        }
+        self.virtual_device.sync();
+        self.keyboard.setCapsLockLED(self.indicator());
+        self.keyboard.sync();
     }
 
-    fn modifier_delta(self: *KeyboardHandler, index: usize, value: i32) void {
-        self.store_delta(InputEvent{
-            .type = EV_KEY,
-            .code = MODIFIERS[index],
-            .value = value,
-            .time_sec = 0,
-            .time_usec = 0,
-        });
+    fn indicator(self: *Handler) i32 {
+        for (self.modifiers) |m| {
+            if (m.state != .Free) return 1;
+        }
+        return 0;
     }
 
-    /// Appends finishing synchronize event to internal change tracking buffer.
-    fn finalize(self: *KeyboardHandler) []u8 {
-        self.store_delta(std.mem.zeroes(InputEvent));
-        const ret: []u8 = @ptrCast(self.delta[0 .. self.n_delta + 1]);
-        self.n_delta = 0;
-        return ret;
+    fn anyLatched(self: *Handler) bool {
+        for (self.modifiers) |m| {
+            if (m.state == .Latched) return true;
+        }
+        return false;
     }
 
-    fn indicator(self: *KeyboardHandler) i32 {
-        return @intFromBool(self.n_free != self.modifiers.len);
-    }
-
-    fn modifier_pressed(self: *KeyboardHandler, modifier_index: usize, event_time_ms: linux.time_t) void {
+    fn modifierPressed(self: *Handler, modifier_index: usize, event_time_ms: linux.time_t) void {
         const modifier = &self.modifiers[modifier_index];
         const elapsed_ms = event_time_ms - modifier.last;
 
         var new_state = ModifierState.Locked;
 
-        if (elapsed_ms > self.double_tap)
+        if (elapsed_ms > self.config.double_tap)
             new_state = ModifierTransition[@intFromEnum(modifier.state)];
 
         if (modifier.state != new_state) {
-            const old_free = modifier.state == .Free;
-            const new_free = new_state == .Free;
-            if (!old_free and new_free) self.n_free += 1;
-            if (!new_free and old_free) self.n_free -= 1;
-
             modifier.state = new_state;
-            self.modifier_delta(modifier_index, new_state.value());
         }
         modifier.last = event_time_ms;
+    }
 
-        std.debug.print("{d} = {any}\t{d} free\n", .{ modifier_index, modifier.state, self.n_free });
+    fn tapEuclideanDistanceSquare(self: *Handler) i64 {
+        const dx = self.touch.ended.x - self.touch.began.x;
+        const dy = self.touch.ended.y - self.touch.began.y;
+        return dx * dx + dy * dy;
     }
 };
 
-const max_path_bytes = Io.Dir.max_path_bytes;
+const input_device_max_size = "/dev/input/event".len + 8;
+const read_buffer_size = 4096;
+const line_buffer_size = 256;
 
 const DeviceDetectionError = error{NoKeyboardFound};
 const DebugError = error{EscapeHatch};
@@ -167,18 +210,20 @@ const DebugError = error{EscapeHatch};
 /// Greedily fills the pb buffer with the name of the first
 /// `kbd` handler device having the word "keyboard" in the name.
 /// Returns the length of the path.
-pub fn detectKeyboard(pb: *[max_path_bytes]u8, io: Io) !usize {
+pub fn detectDevice(pb: *[input_device_max_size]u8, category: DeviceCategory, io: Io) !usize {
     var file = try std.Io.Dir.openFileAbsolute(io, "/proc/bus/input/devices", .{ .mode = .read_only });
     defer file.close(io);
-    return parseInputProcFile(file, pb, io);
+    return parseInputProcFile(file, pb, category, io);
 }
 
-pub fn parseInputProcFile(file: Io.File, pb: *[max_path_bytes]u8, io: Io) !usize {
-    var read_buffer: [4 * max_path_bytes]u8 = undefined;
+const DeviceCategory = enum(u8) { Keyboard, Touchpad };
+
+pub fn parseInputProcFile(file: Io.File, pb: *[input_device_max_size]u8, category: DeviceCategory, io: Io) !usize {
+    var read_buffer: [read_buffer_size]u8 = undefined;
     var fr = file.reader(io, &read_buffer);
     var reader = &fr.interface;
 
-    var line_buffer: [max_path_bytes]u8 = undefined;
+    var line_buffer: [line_buffer_size]u8 = undefined;
     var line = std.Io.Writer.fixed(&line_buffer);
     var name_has_keyboard = false;
 
@@ -194,19 +239,31 @@ pub fn parseInputProcFile(file: Io.File, pb: *[max_path_bytes]u8, io: Io) !usize
             name_has_keyboard = false;
         }
 
+        var name_pattern: []const u8 = @ptrCast("keyboard");
+        var id_pattern: []const u8 = @ptrCast("kbd");
+
+        switch (category) {
+            .Keyboard => {},
+            .Touchpad => {
+                name_pattern = "touchpad";
+                id_pattern = "mouse";
+            },
+        }
+
         if (std.mem.eql(u8, line.buffer[0..name_prefix.len], name_prefix)) {
-            name_has_keyboard = std.mem.find(u8, line.buffer[name_prefix.len..], "keyboard") != null;
+            name_has_keyboard = std.ascii.findIgnoreCase(line.buffer[name_prefix.len..], name_pattern) != null;
             continue;
         }
         if (std.mem.eql(u8, line.buffer[0..handler_prefix.len], handler_prefix) and
-            std.mem.find(u8, line.buffer[handler_prefix.len..], "kbd") != null)
+            std.mem.find(u8, line.buffer[handler_prefix.len..], id_pattern) != null)
         {
             const offset = std.mem.find(u8, line.buffer[handler_prefix.len..], "event") orelse continue;
             const began = offset + handler_prefix.len;
             const ended = (std.mem.find(u8, line.buffer[began..], " ") orelse line.end) + began;
 
             if (name_has_keyboard) {
-                const written = try std.fmt.bufPrint(pb, "/dev/input/{s}", .{line.buffer[began..ended]});
+                // write cstr
+                const written = try std.fmt.bufPrint(pb, "/dev/input/{s}\x00", .{line.buffer[began..ended]});
                 return written.len;
             }
         }
@@ -216,27 +273,38 @@ pub fn parseInputProcFile(file: Io.File, pb: *[max_path_bytes]u8, io: Io) !usize
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    var pb: [max_path_bytes]u8 = undefined;
-    const pb_len = try detectKeyboard(&pb, io);
-    pb[pb_len] = 0;
+    var keyboard_pb: [input_device_max_size]u8 = undefined;
+    var touchpad_pb: [input_device_max_size]u8 = undefined;
+
+    const keyboard_pb_len = try detectDevice(&keyboard_pb, .Keyboard, io);
+    const touchpad_pb_len = try detectDevice(&touchpad_pb, .Touchpad, io);
 
     // pb must live as long as device
-    var device = DeviceContext{
+    var keyboard = DeviceContext{
         .fd = 0,
         .input_event = undefined,
-        .path = pb[0 .. pb_len + 1],
+        .path = keyboard_pb[0..keyboard_pb_len],
     };
 
-    const keyboard: i32 = @intCast(linux.open(@ptrCast(device.path), .{ .ACCMODE = .RDWR, .NONBLOCK = true }, 0o644));
-    defer _ = linux.close(keyboard);
+    keyboard.fd = @intCast(linux.open(@ptrCast(keyboard.path), .{ .ACCMODE = .RDWR, .NONBLOCK = true }, 0o644));
+    defer _ = linux.close(keyboard.fd);
 
-    device.fd = keyboard;
+    var touchpad_device = DeviceContext{
+        .fd = 0,
+        .input_event = undefined,
+        .path = touchpad_pb[0..touchpad_pb_len],
+    };
+
+    touchpad_device.fd = @intCast(linux.open(@ptrCast(touchpad_device.path), .{ .ACCMODE = .RDONLY, .NONBLOCK = true }, 0o644));
+    defer _ = linux.close(touchpad_device.fd);
 
     try io.sleep(.fromSeconds(1), .awake);
 
-    _ = linux.ioctl(device.fd, EVIOCSCLOCKID, CLOCK_MONOTONIC);
-    _ = linux.ioctl(device.fd, EVIOCGRAB, 1);
-    defer _ = linux.ioctl(device.fd, EVIOCGRAB, 0);
+    _ = linux.ioctl(keyboard.fd, EVIOCSCLOCKID, CLOCK_MONOTONIC);
+    _ = linux.ioctl(keyboard.fd, EVIOCGRAB, 1);
+    defer _ = linux.ioctl(keyboard.fd, EVIOCGRAB, 0);
+
+    _ = linux.ioctl(touchpad_device.fd, EVIOCSCLOCKID, CLOCK_MONOTONIC);
 
     try io.sleep(.fromSeconds(1), .awake);
 
@@ -267,29 +335,46 @@ pub fn main(init: std.process.Init) !void {
     var ring = try linux.IoUring.init(16, 0);
     defer ring.deinit();
 
-    std.debug.print("latched to {s}\n", .{device.path});
+    std.debug.print("latched to {s}\n", .{keyboard.path});
 
-    _ = try ring.read(@intFromPtr(&device), device.fd, .{ .buffer = @ptrCast(&device.input_event) }, 0);
-    // TODO: queue future device requests like touchpads here
+    _ = try ring.read(@intFromPtr(&keyboard), keyboard.fd, .{ .buffer = @ptrCast(&keyboard.input_event) }, 0);
+    _ = try ring.read(@intFromPtr(&touchpad_device), touchpad_device.fd, .{ .buffer = @ptrCast(&touchpad_device.input_event) }, 0);
 
     // config from ini file
-    const config = Config{ .double_tap = 200 };
-    var machine: KeyboardHandler = .{ .modifiers = std.mem.zeroes([8]Modifier), .double_tap = config.double_tap, .delta = undefined, .n_delta = 0, .n_free = 8 };
+    const config = Config{
+        .double_tap = 200,
+        .touch_grace_area = 300,
+        .touch_timeout = 500,
+    };
+    var machine: Handler = .{
+        .keyboard = &keyboard,
+        .virtual_device = &virtual_device,
+        .modifiers = std.mem.zeroes([8]Modifier),
+        .config = &config,
+        .touch = std.mem.zeroes(Touch),
+    };
 
-    // ring.timeout(user_data: u64, ts: *const kernel_timespec, count: u32, flags: u32)
-    var user_data: u64 = 0;
-    while (true) : (user_data += 1) {
+    const timer: linux.kernel_timespec = .{
+        .sec = 0,
+        .nsec = 500 * 1000 * 1000,
+    };
+
+    var listening: u64 = 0;
+    while (true) {
         _ = try ring.submit_and_wait(1);
-        try consumeAndRequeue(&ring, &virtual_device, &machine);
+        try consumeAndRequeue(&ring, &machine, &timer, &listening);
     }
 }
 
-fn consumeAndRequeue(ring: *linux.IoUring, virtual_device: *VirtualDevice, machine: *KeyboardHandler) !void {
+fn consumeAndRequeue(ring: *linux.IoUring, machine: *Handler, timer: *const linux.kernel_timespec, listening: *u64) !void {
     const head = ring.cq.head.* & ring.cq.mask;
     const cqe = ring.cq.cqes[head];
     defer ring.cq_advance(1);
 
     if (cqe.res != @sizeOf(InputEvent)) {
+        if (cqe.user_data != listening.*) return;
+        machine.unlatch();
+        machine.commit();
         return;
     }
 
@@ -297,36 +382,91 @@ fn consumeAndRequeue(ring: *linux.IoUring, virtual_device: *VirtualDevice, machi
     const device_context_ptr = cqe.user_data;
     const device_context: *DeviceContext = @ptrFromInt(device_context_ptr);
 
-    const is_key = device_context.input_event.type == EV_KEY;
+    const action = try handleEvent(machine, device_context);
+    if (action == .Trigger) _ = try ring.timeout(listening.*, timer, 0, 0);
+    if (action == .Cancel) listening.* +%= 1;
+    _ = try ring.read(device_context_ptr, device_context.fd, .{ .buffer = @ptrCast(&device_context.input_event) }, 0);
+}
 
-    if (is_key) {
+const TimerAction = enum {
+    Continue,
+    Cancel,
+    Trigger,
+};
+
+fn handleEvent(machine: *Handler, device_context: *DeviceContext) !TimerAction {
+    const is_key = device_context.input_event.type == EV_KEY;
+    const is_coordinate = device_context.input_event.type == EV_ABS;
+    const code = device_context.input_event.code;
+    const value = device_context.input_event.value;
+    const click_not_touch = is_key and (code == BTN_LEFT or code == BTN_RIGHT or code == BTN_TOOL_FINGER);
+    const click_is_touch = is_key and code == BTN_TOUCH;
+    const key_not_click = is_key and !(click_is_touch or click_not_touch);
+    const touch_pressed = click_is_touch and value == 1;
+    const second_tap_in_time = touch_pressed and device_context.input_event.timeMilliseconds() < machine.touch.last_ms + machine.config.touch_timeout;
+    const touch_released = click_is_touch and value == 0;
+    const x_axis = is_coordinate and code == ABS_X;
+    const y_axis = is_coordinate and code == ABS_Y;
+    const threshold: i64 = machine.config.touch_grace_area;
+    const released_within_threshold_circle = touch_released and machine.tapEuclideanDistanceSquare() < threshold * threshold;
+    const released_beyond_threshold_circle = touch_released and !released_within_threshold_circle;
+
+    if (click_not_touch) return .Continue;
+
+    if (touch_pressed) machine.touch.stage = .Initialized;
+    if (second_tap_in_time) return .Cancel;
+    if (touch_released) machine.touch.last_ms = device_context.input_event.timeMilliseconds();
+    if (released_within_threshold_circle and machine.anyLatched()) return .Trigger;
+    if (released_beyond_threshold_circle) {
+        machine.unlatch();
+        machine.commit();
+        return .Continue;
+    }
+
+    if (key_not_click) {
         if (device_context.input_event.code == KEY_RIGHTALT) return DebugError.EscapeHatch;
         const modifier_index = std.mem.findScalar(u16, &MODIFIERS, device_context.input_event.code);
 
         if (modifier_index == null) {
-            machine.store_delta(device_context.input_event);
+            machine.virtual_device.dispatch(@ptrCast(&device_context.input_event));
+            machine.virtual_device.sync();
             machine.unlatch();
-            virtual_device.dispatch(machine.finalize());
+            machine.commit();
         }
 
         if (modifier_index != null and device_context.input_event.value == 1) {
-            const event_time_ms = device_context.input_event.time_sec * 1000 + @divTrunc(device_context.input_event.time_usec, 1000);
-            machine.modifier_pressed(modifier_index.?, event_time_ms);
-            virtual_device.dispatch(machine.finalize());
+            const event_time_ms = device_context.input_event.timeMilliseconds();
+            machine.modifierPressed(modifier_index.?, event_time_ms);
+            machine.commit();
         }
-
-        device_context.setCapsLockLED(machine.indicator());
     }
 
-    _ = try ring.read(device_context_ptr, device_context.fd, .{ .buffer = @ptrCast(&device_context.input_event) }, 0);
+    // the kernel sends x and y values in separate events:
+    // first note x value, then y
+    if (x_axis and machine.touch.stage == .Initialized) {
+        machine.touch.began.x = value;
+        machine.touch.stage = .NotedX;
+    }
+
+    if (y_axis and machine.touch.stage == .NotedX) {
+        machine.touch.began.y = value;
+        machine.touch.stage = .NotedXY;
+    }
+
+    if (x_axis)
+        machine.touch.ended.x = value;
+    if (y_axis)
+        machine.touch.ended.y = value;
+
+    return .Continue;
 }
 
 test "test sample devices proc file" {
     const io = std.testing.io;
     var file = try std.Io.Dir.cwd().openFile(io, "tests/procfile", .{ .mode = .read_only });
     defer file.close(io);
-    var pb: [max_path_bytes]u8 = undefined;
-    const name_len = try parseInputProcFile(file, &pb, io);
+    var pb: [input_device_max_size]u8 = undefined;
+    const name_len = try parseInputProcFile(file, &pb, .Keyboard, io);
     const is_event0 = std.mem.eql(u8, pb[0..name_len], "/dev/input/event0");
     try std.testing.expect(is_event0);
 }
