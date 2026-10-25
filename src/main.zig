@@ -140,6 +140,7 @@ const Touch = struct {
     ended: Point2D,
     last_ms: i64,
     stage: TouchStage,
+    active_timer_id: u64,
 };
 
 const Handler = struct {
@@ -359,20 +360,19 @@ pub fn main(init: std.process.Init) !void {
         .nsec = 500 * 1000 * 1000,
     };
 
-    var listening: u64 = 0;
     while (true) {
         _ = try ring.submit_and_wait(1);
-        try consumeAndRequeue(&ring, &machine, &timer, &listening);
+        try consumeAndRequeue(&ring, &machine, &timer);
     }
 }
 
-fn consumeAndRequeue(ring: *linux.IoUring, machine: *Handler, timer: *const linux.kernel_timespec, listening: *u64) !void {
+fn consumeAndRequeue(ring: *linux.IoUring, machine: *Handler, timer: *const linux.kernel_timespec) !void {
     const head = ring.cq.head.* & ring.cq.mask;
     const cqe = ring.cq.cqes[head];
     defer ring.cq_advance(1);
 
     if (cqe.res != @sizeOf(InputEvent)) {
-        if (cqe.user_data != listening.*) return;
+        if (cqe.user_data != machine.touch.active_timer_id) return;
         machine.unlatch();
         machine.commit();
         return;
@@ -382,63 +382,59 @@ fn consumeAndRequeue(ring: *linux.IoUring, machine: *Handler, timer: *const linu
     const device_context_ptr = cqe.user_data;
     const device_context: *DeviceContext = @ptrFromInt(device_context_ptr);
 
-    const action = try handleEvent(machine, device_context);
-    if (action == .Trigger) _ = try ring.timeout(listening.*, timer, 0, 0);
-    if (action == .Cancel) listening.* +%= 1;
+    const triggerTimer = try handleEvent(machine, device_context);
+    if (triggerTimer) _ = try ring.timeout(machine.touch.active_timer_id, timer, 0, 0);
     _ = try ring.read(device_context_ptr, device_context.fd, .{ .buffer = @ptrCast(&device_context.input_event) }, 0);
 }
 
-const TimerAction = enum {
-    Continue,
-    Cancel,
-    Trigger,
-};
-
-fn handleEvent(machine: *Handler, device_context: *DeviceContext) !TimerAction {
-    const is_key = device_context.input_event.type == EV_KEY;
-    const is_coordinate = device_context.input_event.type == EV_ABS;
+fn handleEvent(machine: *Handler, device_context: *DeviceContext) !bool {
     const code = device_context.input_event.code;
     const value = device_context.input_event.value;
+
+    const is_key = device_context.input_event.type == EV_KEY;
+    const is_coordinate = device_context.input_event.type == EV_ABS;
+    const is_pressed = value == 1;
     const click_not_touch = is_key and (code == BTN_LEFT or code == BTN_RIGHT or code == BTN_TOOL_FINGER);
     const click_is_touch = is_key and code == BTN_TOUCH;
     const key_not_click = is_key and !(click_is_touch or click_not_touch);
-    const touch_pressed = click_is_touch and value == 1;
+    const touch_pressed = click_is_touch and is_pressed;
     const second_tap_in_time = touch_pressed and device_context.input_event.timeMilliseconds() < machine.touch.last_ms + machine.config.touch_timeout;
     const touch_released = click_is_touch and value == 0;
     const x_axis = is_coordinate and code == ABS_X;
     const y_axis = is_coordinate and code == ABS_Y;
     const threshold: i64 = machine.config.touch_grace_area;
-    const released_within_threshold_circle = touch_released and machine.tapEuclideanDistanceSquare() < threshold * threshold;
-    const released_beyond_threshold_circle = touch_released and !released_within_threshold_circle;
+    const released_inside_circle = touch_released and machine.tapEuclideanDistanceSquare() < threshold * threshold;
+    const released_beyond_circle = touch_released and !released_inside_circle;
+    const trigger_timer = released_inside_circle and machine.anyLatched();
+    const modifier_index = if (key_not_click) std.mem.findScalar(u16, &MODIFIERS, device_context.input_event.code) else null;
+    const catchall_key = key_not_click and modifier_index == null;
+    const modifier_key_pressed = modifier_index != null and is_pressed;
 
-    if (click_not_touch) return .Continue;
+    if (touch_released) machine.touch.last_ms = device_context.input_event.timeMilliseconds();
+    if (trigger_timer) return true;
+    if (second_tap_in_time) machine.touch.active_timer_id +%= 1;
 
     if (touch_pressed) machine.touch.stage = .Initialized;
-    if (second_tap_in_time) return .Cancel;
-    if (touch_released) machine.touch.last_ms = device_context.input_event.timeMilliseconds();
-    if (released_within_threshold_circle and machine.anyLatched()) return .Trigger;
-    if (released_beyond_threshold_circle) {
+
+    if (released_beyond_circle) {
         machine.unlatch();
         machine.commit();
-        return .Continue;
     }
 
-    if (key_not_click) {
-        if (device_context.input_event.code == KEY_RIGHTALT) return DebugError.EscapeHatch;
-        const modifier_index = std.mem.findScalar(u16, &MODIFIERS, device_context.input_event.code);
+    if (catchall_key) {
+        machine.virtual_device.dispatch(@ptrCast(&device_context.input_event));
+        machine.virtual_device.sync();
+        machine.unlatch();
+        machine.commit();
+    }
 
-        if (modifier_index == null) {
-            machine.virtual_device.dispatch(@ptrCast(&device_context.input_event));
-            machine.virtual_device.sync();
-            machine.unlatch();
-            machine.commit();
-        }
+    if (modifier_key_pressed) {
+        machine.modifierPressed(modifier_index.?, device_context.input_event.timeMilliseconds());
+        machine.commit();
+    }
 
-        if (modifier_index != null and device_context.input_event.value == 1) {
-            const event_time_ms = device_context.input_event.timeMilliseconds();
-            machine.modifierPressed(modifier_index.?, event_time_ms);
-            machine.commit();
-        }
+    if (key_not_click and device_context.input_event.code == KEY_RIGHTALT) {
+        return DebugError.EscapeHatch;
     }
 
     // the kernel sends x and y values in separate events:
@@ -453,12 +449,10 @@ fn handleEvent(machine: *Handler, device_context: *DeviceContext) !TimerAction {
         machine.touch.stage = .NotedXY;
     }
 
-    if (x_axis)
-        machine.touch.ended.x = value;
-    if (y_axis)
-        machine.touch.ended.y = value;
+    if (x_axis) machine.touch.ended.x = value;
+    if (y_axis) machine.touch.ended.y = value;
 
-    return .Continue;
+    return false;
 }
 
 test "test sample devices proc file" {
