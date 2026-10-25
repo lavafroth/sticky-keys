@@ -357,7 +357,7 @@ pub fn main(init: std.process.Init) !void {
 
     const timer: linux.kernel_timespec = .{
         .sec = 0,
-        .nsec = 500 * 1000 * 1000,
+        .nsec = config.touch_timeout * 1000 * 1000,
     };
 
     while (true) {
