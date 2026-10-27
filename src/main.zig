@@ -1,32 +1,11 @@
 const std = @import("std");
 const Io = std.Io;
-
 const linux = std.os.linux;
-
-pub const BTN_LEFT = 0x110;
-pub const BTN_RIGHT = 0x111;
-pub const BTN_TOOL_FINGER = 0x145;
-pub const BTN_TOUCH = 0x14a;
-pub const UInputSetup = extern struct {
-    bustype: u16,
-    vendor: u16,
-    product: u16,
-    version: u16,
-    name: [80]u8,
-    ff_effects_max: u32 = 0,
-};
 
 /// ioctl command to exclusively grab a device
 pub const EVIOCGRAB = linux.IOCTL.IOW('E', 0x90, c_int);
 pub const EVIOCSCLOCKID = linux.IOCTL.IOW('E', 0xa0, c_int);
 pub const CLOCK_MONOTONIC = 1;
-
-const UINPUT_IOCTL_BASE = 'U';
-pub const UI_SET_EVBIT = linux.IOCTL.IOW(UINPUT_IOCTL_BASE, 100, c_int);
-pub const UI_SET_KEYBIT = linux.IOCTL.IOW(UINPUT_IOCTL_BASE, 101, c_int);
-pub const UI_DEV_CREATE = linux.IOCTL.IO(UINPUT_IOCTL_BASE, 1);
-pub const UI_DEV_DESTROY = linux.IOCTL.IO(UINPUT_IOCTL_BASE, 2);
-pub const UI_DEV_SETUP = linux.IOCTL.IOW(UINPUT_IOCTL_BASE, 3, UInputSetup);
 pub const EV_SYN = 0x00;
 pub const EV_KEY = 0x01;
 pub const ABS_X = 0x00;
@@ -35,7 +14,6 @@ pub const EV_ABS = 0x03;
 pub const SYN_REPORT = 0x00;
 pub const KEY_MAX = 0x2ff;
 pub const KEY_CNT = KEY_MAX + 1;
-
 pub const KEY_LEFTCTRL = 29;
 pub const KEY_RIGHTCTRL = 97;
 pub const KEY_LEFTSHIFT = 42;
@@ -46,7 +24,30 @@ pub const KEY_LEFTALT = 56;
 pub const KEY_RIGHTALT = 100;
 pub const EV_LED = 0x11;
 pub const LED_CAPSL = 0x01;
+pub const BTN_LEFT = 0x110;
+pub const BTN_RIGHT = 0x111;
+pub const BTN_TOOL_FINGER = 0x145;
+pub const BTN_TOUCH = 0x14a;
+
 const MODIFIERS = [_]u16{ KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_LEFTMETA, KEY_RIGHTMETA, KEY_LEFTALT, KEY_RIGHTALT };
+
+const MODIFIER_NAMES = [_][]const u8{ "leftctrl", "rightctrl", "leftshift", "rightshift", "leftmeta", "rightmeta", "leftalt", "rightalt" };
+
+pub const UInputSetup = extern struct {
+    bustype: u16,
+    vendor: u16,
+    product: u16,
+    version: u16,
+    name: [80]u8,
+    ff_effects_max: u32 = 0,
+};
+
+const UINPUT_IOCTL_BASE = 'U';
+pub const UI_SET_EVBIT = linux.IOCTL.IOW(UINPUT_IOCTL_BASE, 100, c_int);
+pub const UI_SET_KEYBIT = linux.IOCTL.IOW(UINPUT_IOCTL_BASE, 101, c_int);
+pub const UI_DEV_CREATE = linux.IOCTL.IO(UINPUT_IOCTL_BASE, 1);
+pub const UI_DEV_DESTROY = linux.IOCTL.IO(UINPUT_IOCTL_BASE, 2);
+pub const UI_DEV_SETUP = linux.IOCTL.IOW(UINPUT_IOCTL_BASE, 3, UInputSetup);
 
 const InputEvent = extern struct {
     time_sec: linux.time_t,
@@ -84,12 +85,7 @@ const VirtualDevice = struct {
         _ = linux.write(self.fd, @ptrCast(transaction), transaction.len);
     }
 
-    fn sendEvent(
-        self: *VirtualDevice,
-        typ: u16,
-        code: u16,
-        value: i32,
-    ) void {
+    fn sendEvent(self: *VirtualDevice, typ: u16, code: u16, value: i32) void {
         self.dispatch(@ptrCast(&InputEvent{ .code = code, .type = typ, .value = value, .time_sec = 0, .time_usec = 0 }));
     }
 
@@ -97,11 +93,7 @@ const VirtualDevice = struct {
         self.sendEvent(EV_SYN, SYN_REPORT, 0);
     }
 
-    fn sendKey(
-        self: *VirtualDevice,
-        code: u16,
-        value: i32,
-    ) void {
+    fn sendKey(self: *VirtualDevice, code: u16, value: i32) void {
         self.sendEvent(EV_KEY, code, value);
     }
 };
@@ -110,6 +102,7 @@ const Config = struct {
     double_tap: u64,
     touch_timeout: i64,
     touch_grace_area: i64,
+    modifiers_enabled: [8]bool,
 };
 
 const ModifierState = enum(u8) {
@@ -188,9 +181,8 @@ const Handler = struct {
         if (elapsed_ms > self.config.double_tap)
             new_state = ModifierTransition[@intFromEnum(modifier.state)];
 
-        if (modifier.state != new_state) {
-            modifier.state = new_state;
-        }
+        if (modifier.state != new_state) modifier.state = new_state;
+
         modifier.last = event_time_ms;
     }
 
@@ -272,8 +264,82 @@ pub fn parseInputProcFile(file: Io.File, pb: *[input_device_max_size]u8, categor
     return DeviceDetectionError.NoKeyboardFound;
 }
 
+pub fn parseConfig(path: []const u8, io: Io) !Config {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    var read_buffer: [read_buffer_size]u8 = undefined;
+    var fr = file.reader(io, &read_buffer);
+    var reader = &fr.interface;
+
+    var line_buffer: [line_buffer_size]u8 = undefined;
+    var line = std.Io.Writer.fixed(&line_buffer);
+
+    var config = Config{
+        .double_tap = 200,
+        .touch_grace_area = 300,
+        .touch_timeout = 500,
+        .modifiers_enabled = [8]bool{ false, false, false, false, false, false, false, false },
+    };
+    while (true) : (line.end = 0) {
+        const consumed = reader.streamDelimiter(&line, '\n') catch |err| {
+            if (err == error.EndOfStream) break else return err;
+        };
+        _ = reader.toss(1);
+        if (consumed == 0) continue;
+
+        var iter = std.mem.splitScalar(u8, line_buffer[0..line.end], '=');
+        var opt = ConfigOption.None;
+        var left = true;
+        while (iter.next()) |entry| {
+            const trimmed_entry = std.mem.trim(u8, entry, " ");
+            if (left) {
+                if (std.mem.eql(u8, trimmed_entry, "touchpad.unlatch-timeout-ms")) opt = ConfigOption.TouchTimeout;
+                if (std.mem.eql(u8, trimmed_entry, "touchpad.grace-area")) opt = ConfigOption.TouchGraceArea;
+                if (std.mem.eql(u8, trimmed_entry, "double-tap-timeout-ms")) opt = ConfigOption.DoubleTap;
+                if (std.mem.eql(u8, trimmed_entry, "modifiers")) opt = ConfigOption.Modifiers;
+                left = false;
+                continue;
+            }
+
+            if (opt == .DoubleTap) config.double_tap = try std.fmt.parseUnsigned(u64, trimmed_entry, 10);
+            if (opt == .TouchGraceArea) config.touch_grace_area = @intCast(try std.fmt.parseUnsigned(u32, trimmed_entry, 10));
+            if (opt == .TouchTimeout) config.touch_timeout = @intCast(try std.fmt.parseUnsigned(u32, trimmed_entry, 10));
+            if (opt == .Modifiers) {
+                var modifiers = std.mem.splitScalar(u8, trimmed_entry, ' ');
+                while (modifiers.next()) |modifier| {
+                    for (0.., MODIFIER_NAMES) |i, name| {
+                        if (std.mem.eql(u8, name, modifier)) {
+                            config.modifiers_enabled[i] = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    var any_modifier_chosen = false;
+    for (config.modifiers_enabled) |v| any_modifier_chosen |= v;
+
+    if (!any_modifier_chosen) {
+        config.modifiers_enabled = [8]bool{ true, true, true, true, true, true, true, true };
+    }
+    return config;
+}
+
+pub const ConfigOption = enum {
+    DoubleTap,
+    TouchGraceArea,
+    TouchTimeout,
+    Modifiers,
+    None,
+};
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
+    // config from ini file
+    const config = try parseConfig("./config.ini", io);
+
     var keyboard_pb: [input_device_max_size]u8 = undefined;
     var touchpad_pb: [input_device_max_size]u8 = undefined;
 
@@ -341,12 +407,6 @@ pub fn main(init: std.process.Init) !void {
     _ = try ring.read(@intFromPtr(&keyboard), keyboard.fd, .{ .buffer = @ptrCast(&keyboard.input_event) }, 0);
     _ = try ring.read(@intFromPtr(&touchpad_device), touchpad_device.fd, .{ .buffer = @ptrCast(&touchpad_device.input_event) }, 0);
 
-    // config from ini file
-    const config = Config{
-        .double_tap = 200,
-        .touch_grace_area = 300,
-        .touch_timeout = 500,
-    };
     var machine: Handler = .{
         .keyboard = &keyboard,
         .virtual_device = &virtual_device,
@@ -407,8 +467,9 @@ fn handleEvent(machine: *Handler, device_context: *DeviceContext) !bool {
     const released_beyond_circle = touch_released and !released_inside_circle;
     const trigger_timer = released_inside_circle and machine.anyLatched();
     const modifier_index = if (key_not_click) std.mem.findScalar(u16, &MODIFIERS, device_context.input_event.code) else null;
+    const passthrough_modifier = modifier_index != null and !machine.config.modifiers_enabled[modifier_index.?];
     const catchall_key = key_not_click and modifier_index == null;
-    const modifier_key_pressed = modifier_index != null and is_pressed;
+    const modifier_key_pressed = modifier_index != null and is_pressed and !passthrough_modifier;
 
     if (touch_released) machine.touch.last_ms = device_context.input_event.timeMilliseconds();
     if (trigger_timer) return true;
@@ -425,6 +486,17 @@ fn handleEvent(machine: *Handler, device_context: *DeviceContext) !bool {
         machine.virtual_device.dispatch(@ptrCast(&device_context.input_event));
         machine.virtual_device.sync();
         machine.unlatch();
+        machine.commit();
+    }
+
+    if (passthrough_modifier) {
+        if (value == 0) {
+            machine.modifiers[modifier_index.?].state = .Free;
+        } else {
+            machine.modifiers[modifier_index.?].state = .Locked;
+        }
+        machine.virtual_device.dispatch(@ptrCast(&device_context.input_event));
+        machine.virtual_device.sync();
         machine.commit();
     }
 
