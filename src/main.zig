@@ -247,7 +247,7 @@ pub fn parseInputProcFile(file: Io.File, pb: *[input_device_max_size]u8, categor
             const ended = std.mem.findScalarPos(u8, line_contents, began, ' ') orelse line.end;
 
             // write cstr
-            const written = try std.fmt.bufPrint(pb, "/dev/input/{s}\x00", .{line_contents[began..ended]});
+            const written = try std.fmt.bufPrint(pb, "/dev/input/{s}", .{line_contents[began..ended]});
             return written.len;
         }
     }
@@ -256,9 +256,9 @@ pub fn parseInputProcFile(file: Io.File, pb: *[input_device_max_size]u8, categor
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    // config from ini file
+
     var args_iter = init.minimal.args.iterate();
-    _ = args_iter.next();
+    _ = args_iter.next(); // skip program name
     const config_path = args_iter.next();
     const config_opts = if (config_path != null) try config.parseConfig(config_path.?, io) else config.default;
 
@@ -275,17 +275,25 @@ pub fn main(init: std.process.Init) !void {
         .path = keyboard_pb[0..keyboard_pb_len],
     };
 
-    keyboard.fd = @intCast(linux.open(@ptrCast(keyboard.path), .{ .ACCMODE = .RDWR, .NONBLOCK = true }, 0o644));
-    defer _ = linux.close(keyboard.fd);
+    const keyboard_file = std.Io.Dir.openFileAbsolute(io, keyboard.path, .{ .mode = .read_write, .lock_nonblocking = true }) catch |err| {
+        std.log.err("failed to open keyboard device: {s}", .{keyboard.path});
+        return err;
+    };
+    defer keyboard_file.close(io);
+    keyboard.fd = keyboard_file.handle;
 
-    var touchpad_device = DeviceContext{
+    var touchpad = DeviceContext{
         .fd = 0,
         .input_event = undefined,
         .path = touchpad_pb[0..touchpad_pb_len],
     };
 
-    touchpad_device.fd = @intCast(linux.open(@ptrCast(touchpad_device.path), .{ .ACCMODE = .RDONLY, .NONBLOCK = true }, 0o644));
-    defer _ = linux.close(touchpad_device.fd);
+    const touchpad_file = std.Io.Dir.openFileAbsolute(io, touchpad.path, .{ .mode = .read_only, .lock_nonblocking = true }) catch |err| {
+        std.log.err("failed to open touchpad device: {s}", .{touchpad.path});
+        return err;
+    };
+    defer touchpad_file.close(io);
+    touchpad.fd = touchpad_file.handle;
 
     try io.sleep(.fromSeconds(1), .awake);
 
@@ -293,7 +301,7 @@ pub fn main(init: std.process.Init) !void {
     _ = linux.ioctl(keyboard.fd, EVIOCGRAB, 1);
     defer _ = linux.ioctl(keyboard.fd, EVIOCGRAB, 0);
 
-    _ = linux.ioctl(touchpad_device.fd, EVIOCSCLOCKID, CLOCK_MONOTONIC);
+    _ = linux.ioctl(touchpad.fd, EVIOCSCLOCKID, CLOCK_MONOTONIC);
 
     try io.sleep(.fromSeconds(1), .awake);
 
@@ -327,7 +335,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("latched to {s}\n", .{keyboard.path});
 
     _ = try ring.read(@intFromPtr(&keyboard), keyboard.fd, .{ .buffer = @ptrCast(&keyboard.input_event) }, 0);
-    _ = try ring.read(@intFromPtr(&touchpad_device), touchpad_device.fd, .{ .buffer = @ptrCast(&touchpad_device.input_event) }, 0);
+    _ = try ring.read(@intFromPtr(&touchpad), touchpad.fd, .{ .buffer = @ptrCast(&touchpad.input_event) }, 0);
 
     var machine: Handler = .{
         .keyboard = &keyboard,
@@ -455,6 +463,6 @@ test "test sample devices proc file" {
     defer file.close(io);
     var pb: [input_device_max_size]u8 = undefined;
     const name_len = try parseInputProcFile(file, &pb, .Keyboard, io);
-    const is_event0 = std.mem.eql(u8, pb[0..name_len], "/dev/input/event0\x00");
+    const is_event0 = std.mem.eql(u8, pb[0..name_len], "/dev/input/event0");
     try std.testing.expect(is_event0);
 }
