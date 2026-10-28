@@ -466,3 +466,59 @@ test "test sample devices proc file" {
     const is_event0 = std.mem.eql(u8, pb[0..name_len], "/dev/input/event0");
     try std.testing.expect(is_event0);
 }
+
+test "test handler latch unlatch then lock" {
+    var machine: Handler = .{
+        .config = &config.default,
+        .keyboard = undefined,
+        .virtual_device = undefined,
+        .modifiers = std.mem.zeroes([8]Modifier),
+        .touch = std.mem.zeroes(Touch),
+    };
+
+    const began_ms = 400;
+    var now: i64 = began_ms;
+    machine.modifierPressed(0, now);
+    try std.testing.expect(machine.modifiers[0].state == .Latched);
+    try std.testing.expect(machine.modifiers[0].last == now);
+
+    now += 300;
+
+    machine.modifierPressed(0, now);
+    try std.testing.expect(machine.modifiers[0].state == .Free);
+    try std.testing.expect(machine.modifiers[0].last == now);
+
+    now += 400;
+
+    machine.modifierPressed(0, now);
+    try std.testing.expect(machine.modifiers[0].state == .Latched);
+    try std.testing.expect(machine.modifiers[0].last == now);
+
+    now += 100;
+
+    machine.modifierPressed(0, now);
+    try std.testing.expect(machine.modifiers[0].state == .Locked);
+    try std.testing.expect(machine.modifiers[0].last == now);
+}
+
+test "test handler lock" {
+    var machine: Handler = .{
+        .config = &config.default,
+        .keyboard = undefined,
+        .virtual_device = undefined,
+        .modifiers = std.mem.zeroes([8]Modifier),
+        .touch = std.mem.zeroes(Touch),
+    };
+
+    const began_ms = 400;
+    var now: i64 = began_ms;
+    machine.modifierPressed(0, now);
+    try std.testing.expect(machine.modifiers[0].state == .Latched);
+    try std.testing.expect(machine.modifiers[0].last == now);
+
+    now += 100;
+
+    machine.modifierPressed(0, now);
+    try std.testing.expect(machine.modifiers[0].state == .Locked);
+    try std.testing.expect(machine.modifiers[0].last == now);
+}
