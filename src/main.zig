@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const linux = std.os.linux;
+const config = @import("config.zig");
 
 /// ioctl command to exclusively grab a device
 pub const EVIOCGRAB = linux.IOCTL.IOW('E', 0x90, c_int);
@@ -30,8 +31,6 @@ pub const BTN_TOOL_FINGER = 0x145;
 pub const BTN_TOUCH = 0x14a;
 
 const MODIFIERS = [_]u16{ KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_LEFTMETA, KEY_RIGHTMETA, KEY_LEFTALT, KEY_RIGHTALT };
-
-const MODIFIER_NAMES = [_][]const u8{ "leftctrl", "rightctrl", "leftshift", "rightshift", "leftmeta", "rightmeta", "leftalt", "rightalt" };
 
 pub const UInputSetup = extern struct {
     bustype: u16,
@@ -98,13 +97,6 @@ const VirtualDevice = struct {
     }
 };
 
-const Config = struct {
-    double_tap: u64,
-    touch_timeout: i64,
-    touch_grace_area: i64,
-    modifiers_enabled: [8]bool,
-};
-
 const ModifierState = enum(u8) {
     Free,
     Latched,
@@ -141,7 +133,7 @@ const Handler = struct {
     keyboard: *DeviceContext,
     virtual_device: *VirtualDevice,
     touch: Touch,
-    config: *const Config,
+    config: *const config.Config,
 
     fn unlatch(self: *Handler) void {
         for (0..self.modifiers.len) |i| {
@@ -264,81 +256,13 @@ pub fn parseInputProcFile(file: Io.File, pb: *[input_device_max_size]u8, categor
     return DeviceDetectionError.NoKeyboardFound;
 }
 
-pub fn parseConfig(path: []const u8, io: Io) !Config {
-    var file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
-    defer file.close(io);
-    var read_buffer: [read_buffer_size]u8 = undefined;
-    var fr = file.reader(io, &read_buffer);
-    var reader = &fr.interface;
-
-    var line_buffer: [line_buffer_size]u8 = undefined;
-    var line = std.Io.Writer.fixed(&line_buffer);
-
-    var config = Config{
-        .double_tap = 200,
-        .touch_grace_area = 300,
-        .touch_timeout = 500,
-        .modifiers_enabled = [8]bool{ false, false, false, false, false, false, false, false },
-    };
-    while (true) : (line.end = 0) {
-        const consumed = reader.streamDelimiter(&line, '\n') catch |err| {
-            if (err == error.EndOfStream) break else return err;
-        };
-        _ = reader.toss(1);
-        if (consumed == 0) continue;
-
-        var iter = std.mem.splitScalar(u8, line_buffer[0..line.end], '=');
-        var opt = ConfigOption.None;
-        var left = true;
-        while (iter.next()) |entry| {
-            const trimmed_entry = std.mem.trim(u8, entry, " ");
-            if (left) {
-                if (std.mem.eql(u8, trimmed_entry, "touchpad.unlatch-timeout-ms")) opt = ConfigOption.TouchTimeout;
-                if (std.mem.eql(u8, trimmed_entry, "touchpad.grace-area")) opt = ConfigOption.TouchGraceArea;
-                if (std.mem.eql(u8, trimmed_entry, "double-tap-timeout-ms")) opt = ConfigOption.DoubleTap;
-                if (std.mem.eql(u8, trimmed_entry, "modifiers")) opt = ConfigOption.Modifiers;
-                left = false;
-                continue;
-            }
-
-            if (opt == .DoubleTap) config.double_tap = try std.fmt.parseUnsigned(u64, trimmed_entry, 10);
-            if (opt == .TouchGraceArea) config.touch_grace_area = @intCast(try std.fmt.parseUnsigned(u32, trimmed_entry, 10));
-            if (opt == .TouchTimeout) config.touch_timeout = @intCast(try std.fmt.parseUnsigned(u32, trimmed_entry, 10));
-            if (opt == .Modifiers) {
-                var modifiers = std.mem.splitScalar(u8, trimmed_entry, ' ');
-                while (modifiers.next()) |modifier| {
-                    for (0.., MODIFIER_NAMES) |i, name| {
-                        if (std.mem.eql(u8, name, modifier)) {
-                            config.modifiers_enabled[i] = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    var any_modifier_chosen = false;
-    for (config.modifiers_enabled) |v| any_modifier_chosen |= v;
-
-    if (!any_modifier_chosen) {
-        config.modifiers_enabled = [8]bool{ true, true, true, true, true, true, true, true };
-    }
-    return config;
-}
-
-pub const ConfigOption = enum {
-    DoubleTap,
-    TouchGraceArea,
-    TouchTimeout,
-    Modifiers,
-    None,
-};
-
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     // config from ini file
-    const config = try parseConfig("./config.ini", io);
+    var args_iter = init.minimal.args.iterate();
+    _ = args_iter.next();
+    const config_path = args_iter.next();
+    const config_opts = if (config_path != null) try config.parseConfig(config_path.?, io) else config.default;
 
     var keyboard_pb: [input_device_max_size]u8 = undefined;
     var touchpad_pb: [input_device_max_size]u8 = undefined;
@@ -411,13 +335,13 @@ pub fn main(init: std.process.Init) !void {
         .keyboard = &keyboard,
         .virtual_device = &virtual_device,
         .modifiers = std.mem.zeroes([8]Modifier),
-        .config = &config,
+        .config = &config_opts,
         .touch = std.mem.zeroes(Touch),
     };
 
     const timer: linux.kernel_timespec = .{
         .sec = 0,
-        .nsec = config.touch_timeout * 1000 * 1000,
+        .nsec = config_opts.touch_timeout * 1000 * 1000,
     };
 
     while (true) {
