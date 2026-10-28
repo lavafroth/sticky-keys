@@ -224,33 +224,31 @@ pub fn parseInputProcFile(file: Io.File, pb: *[input_device_max_size]u8, categor
             name_has_keyboard = false;
         }
 
+        const line_contents = line.buffer[0..line.end];
+
         var name_pattern: []const u8 = @ptrCast("keyboard");
-        var id_pattern: []const u8 = @ptrCast("kbd");
+        var type_pattern: []const u8 = @ptrCast("kbd");
 
         switch (category) {
             .Keyboard => {},
             .Touchpad => {
                 name_pattern = "touchpad";
-                id_pattern = "mouse";
+                type_pattern = "mouse";
             },
         }
 
-        if (std.mem.eql(u8, line.buffer[0..name_prefix.len], name_prefix)) {
-            name_has_keyboard = std.ascii.findIgnoreCase(line.buffer[name_prefix.len..], name_pattern) != null;
+        if (std.mem.startsWith(u8, line_contents, name_prefix)) {
+            name_has_keyboard = std.ascii.findIgnoreCase(line_contents[name_prefix.len..], name_pattern) != null;
             continue;
         }
-        if (std.mem.eql(u8, line.buffer[0..handler_prefix.len], handler_prefix) and
-            std.mem.find(u8, line.buffer[handler_prefix.len..], id_pattern) != null)
-        {
-            const offset = std.mem.find(u8, line.buffer[handler_prefix.len..], "event") orelse continue;
-            const began = offset + handler_prefix.len;
-            const ended = (std.mem.find(u8, line.buffer[began..], " ") orelse line.end) + began;
+        if (name_has_keyboard and std.mem.startsWith(u8, line_contents, handler_prefix)) {
+            _ = std.mem.findPos(u8, line_contents, handler_prefix.len, type_pattern) orelse continue;
+            const began = std.mem.findPos(u8, line_contents, handler_prefix.len, "event") orelse continue;
+            const ended = std.mem.findScalarPos(u8, line_contents, began, ' ') orelse line.end;
 
-            if (name_has_keyboard) {
-                // write cstr
-                const written = try std.fmt.bufPrint(pb, "/dev/input/{s}\x00", .{line.buffer[began..ended]});
-                return written.len;
-            }
+            // write cstr
+            const written = try std.fmt.bufPrint(pb, "/dev/input/{s}\x00", .{line_contents[began..ended]});
+            return written.len;
         }
     }
     return DeviceDetectionError.NoKeyboardFound;
