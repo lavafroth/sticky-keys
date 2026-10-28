@@ -455,6 +455,6 @@ test "test sample devices proc file" {
     defer file.close(io);
     var pb: [input_device_max_size]u8 = undefined;
     const name_len = try parseInputProcFile(file, &pb, .Keyboard, io);
-    const is_event0 = std.mem.eql(u8, pb[0..name_len], "/dev/input/event0");
+    const is_event0 = std.mem.eql(u8, pb[0..name_len], "/dev/input/event0\x00");
     try std.testing.expect(is_event0);
 }
