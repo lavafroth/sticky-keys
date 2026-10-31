@@ -171,7 +171,7 @@ const Handler = struct {
         var new_state = ModifierState.Locked;
 
         if (elapsed_ms > self.config.double_tap)
-            new_state = ModifierTransition[@intFromEnum(modifier.state)];
+            new_state = ModifierTransition[@backingInt(modifier.state)];
 
         if (modifier.state != new_state) modifier.state = new_state;
 
@@ -195,7 +195,7 @@ const DebugError = error{EscapeHatch};
 /// Greedily fills the pb buffer with the name of the first
 /// `kbd` handler device having the word "keyboard" in the name.
 /// Returns the length of the path.
-pub fn detectDevice(pb: *[input_device_max_size]u8, category: DeviceCategory, io: Io) !usize {
+pub fn detectDevice(pb: *[input_device_max_size]u8, category: DeviceCategory, io: Io) ![]u8 {
     var file = try std.Io.Dir.openFileAbsolute(io, "/proc/bus/input/devices", .{ .mode = .read_only });
     defer file.close(io);
     return parseInputProcFile(file, pb, category, io);
@@ -203,7 +203,7 @@ pub fn detectDevice(pb: *[input_device_max_size]u8, category: DeviceCategory, io
 
 const DeviceCategory = enum(u8) { Keyboard, Touchpad };
 
-pub fn parseInputProcFile(file: Io.File, pb: *[input_device_max_size]u8, category: DeviceCategory, io: Io) !usize {
+pub fn parseInputProcFile(file: Io.File, pb: *[input_device_max_size]u8, category: DeviceCategory, io: Io) ![]u8 {
     var read_buffer: [read_buffer_size]u8 = undefined;
     var fr = file.reader(io, &read_buffer);
     var reader = &fr.interface;
@@ -238,7 +238,7 @@ pub fn parseInputProcFile(file: Io.File, pb: *[input_device_max_size]u8, categor
         }
 
         if (std.mem.startsWith(u8, line_contents, name_prefix)) {
-            name_has_keyboard = std.ascii.findIgnoreCase(line_contents[name_prefix.len..], name_pattern) != null;
+            name_has_keyboard = std.ascii.findIgnoreCasePos(line_contents, name_prefix.len, name_pattern) != null;
             continue;
         }
         if (name_has_keyboard and std.mem.startsWith(u8, line_contents, handler_prefix)) {
@@ -246,9 +246,8 @@ pub fn parseInputProcFile(file: Io.File, pb: *[input_device_max_size]u8, categor
             const began = std.mem.findPos(u8, line_contents, handler_prefix.len, "event") orelse continue;
             const ended = std.mem.findScalarPos(u8, line_contents, began, ' ') orelse line.end;
 
-            // write cstr
             const written = try std.fmt.bufPrint(pb, "/dev/input/{s}", .{line_contents[began..ended]});
-            return written.len;
+            return written; // referencing data owned by main
         }
     }
     return DeviceDetectionError.NoKeyboardFound;
@@ -265,14 +264,11 @@ pub fn main(init: std.process.Init) !void {
     var keyboard_pb: [input_device_max_size]u8 = undefined;
     var touchpad_pb: [input_device_max_size]u8 = undefined;
 
-    const keyboard_pb_len = try detectDevice(&keyboard_pb, .Keyboard, io);
-    const touchpad_pb_len = try detectDevice(&touchpad_pb, .Touchpad, io);
-
     // pb must live as long as device
     var keyboard = DeviceContext{
         .fd = 0,
         .input_event = undefined,
-        .path = keyboard_pb[0..keyboard_pb_len],
+        .path = try detectDevice(&keyboard_pb, .Keyboard, io),
     };
 
     const keyboard_file = std.Io.Dir.openFileAbsolute(io, keyboard.path, .{ .mode = .read_write, .lock_nonblocking = true }) catch |err| {
@@ -285,7 +281,7 @@ pub fn main(init: std.process.Init) !void {
     var touchpad = DeviceContext{
         .fd = 0,
         .input_event = undefined,
-        .path = touchpad_pb[0..touchpad_pb_len],
+        .path = try detectDevice(&touchpad_pb, .Touchpad, io),
     };
 
     const touchpad_file = std.Io.Dir.openFileAbsolute(io, touchpad.path, .{ .mode = .read_only, .lock_nonblocking = true }) catch |err| {
@@ -462,8 +458,8 @@ test "test sample devices proc file" {
     var file = try std.Io.Dir.cwd().openFile(io, "tests/procfile", .{ .mode = .read_only });
     defer file.close(io);
     var pb: [input_device_max_size]u8 = undefined;
-    const name_len = try parseInputProcFile(file, &pb, .Keyboard, io);
-    const is_event0 = std.mem.eql(u8, pb[0..name_len], "/dev/input/event0");
+    const name = try parseInputProcFile(file, &pb, .Keyboard, io);
+    const is_event0 = std.mem.eql(u8, name, "/dev/input/event0");
     try std.testing.expect(is_event0);
 }
 
